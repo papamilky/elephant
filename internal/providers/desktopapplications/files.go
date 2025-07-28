@@ -136,7 +136,7 @@ func watchFiles() {
 				return
 			}
 
-			handleFileEvent(event)
+			go handleFileEvent(event)
 
 		case err, ok := <-watcher.Errors:
 			if !ok {
