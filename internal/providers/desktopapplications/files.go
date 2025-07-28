@@ -24,9 +24,7 @@ var (
 func loadFiles() {
 	start := time.Now()
 
-	filesMu.Lock()
 	files = make(map[string]*DesktopFile)
-	filesMu.Unlock()
 
 	getLocale()
 
@@ -71,9 +69,7 @@ func loadFiles() {
 
 	}
 
-	filesMu.RLock()
 	fileCount := len(files)
-	filesMu.RUnlock()
 
 	slog.Info(Name, "files", fileCount, "time", time.Since(start))
 }
