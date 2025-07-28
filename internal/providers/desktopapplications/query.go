@@ -16,7 +16,11 @@ func Query(query string) []common.Entry {
 	desktop := os.Getenv("XDG_CURRENT_DESKTOP")
 	entries := []common.Entry{}
 
-	for k, v := range files {
+	filesMu.RLock()
+	filesCopy := files
+	filesMu.RUnlock()
+
+	for k, v := range filesCopy {
 		if len(v.NotShowIn) != 0 && slices.Contains(v.NotShowIn, desktop) || len(v.OnlyShowIn) != 0 && !slices.Contains(v.OnlyShowIn, desktop) || v.Hidden || v.NoDisplay {
 			continue
 		}
