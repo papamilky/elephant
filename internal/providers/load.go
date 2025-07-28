@@ -7,29 +7,33 @@ import (
 	"os"
 	"path/filepath"
 	"plugin"
+	"sync"
+	"time"
 
 	"github.com/abenz1267/elephant/internal/common"
 	"github.com/charlievieth/fastwalk"
 )
 
 type Provider struct {
-	Name        *string
-	NamePretty  *string
-	Load        func()
-	PrintConfig func()
-	Cleanup     func()
-	Activate    func(sid uint32, identifier, action string)
-	Query       func(text string) []common.Entry
+	Name          *string
+	NamePretty    *string
+	Load          func()
+	PrintDoc      func()
+	Cleanup       func(qid uint32)
+	EntryToString func(common.Entry) string
+	Activate      func(qid uint32, identifier, action string)
+	Query         func(qid uint32, text string) []common.Entry
 }
 
 var Providers map[string]Provider
 
 func Load() {
+	start := time.Now()
 	Providers = make(map[string]Provider)
 	dir := filepath.Join(common.ConfigDir(), "providers")
 
 	if !common.FileExists(dir) {
-		slog.Error("elephant", "providers", "you don't have any providers installed")
+		slog.Error("providers", "load", "you don't have any providers installed")
 		os.Exit(1)
 	}
 
@@ -64,6 +68,11 @@ func Load() {
 				slog.Error("providers", "load", err, "provider", path)
 			}
 
+			entryToStringFunc, err := p.Lookup("EntryToString")
+			if err != nil {
+				slog.Error("providers", "load", err, "provider", path)
+			}
+
 			activateFunc, err := p.Lookup("Activate")
 			if err != nil {
 				slog.Error("providers", "load", err, "provider", path)
@@ -85,13 +94,14 @@ func Load() {
 			}
 
 			provider := Provider{
-				Load:        loadFunc.(func()),
-				Name:        name.(*string),
-				Cleanup:     cleanupFunc.(func()),
-				Activate:    activateFunc.(func(sid uint32, identifier, action string)),
-				Query:       queryFunc.(func(string) []common.Entry),
-				NamePretty:  namePretty.(*string),
-				PrintConfig: printDocFunc.(func()),
+				Load:          loadFunc.(func()),
+				Name:          name.(*string),
+				EntryToString: entryToStringFunc.(func(common.Entry) string),
+				Cleanup:       cleanupFunc.(func(uint32)),
+				Activate:      activateFunc.(func(qid uint32, identifier, action string)),
+				Query:         queryFunc.(func(uint32, string) []common.Entry),
+				NamePretty:    namePretty.(*string),
+				PrintDoc:      printDocFunc.(func()),
 			}
 
 			Providers[*provider.Name] = provider
@@ -106,13 +116,26 @@ func Load() {
 	}
 
 	if len(Providers) == 0 {
-		slog.Error("elephant", "providers", "you don't have any providers installed")
+		slog.Error("providers", "load", "you don't have any providers installed")
 		os.Exit(1)
 	}
+
+	slog.Info("providers", "loaded", len(Providers), "time", time.Since(start))
 }
 
 func Setup() {
+	start := time.Now()
+	var wg sync.WaitGroup
+	wg.Add(len(Providers))
+
 	for _, v := range Providers {
-		v.Load()
+		go func(wg *sync.WaitGroup, p Provider) {
+			defer wg.Done()
+			p.Load()
+		}(&wg, v)
 	}
+
+	wg.Wait()
+
+	slog.Info("providers", "setup", time.Since(start))
 }

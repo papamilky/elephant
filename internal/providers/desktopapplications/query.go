@@ -5,55 +5,86 @@ import (
 	"log/slog"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/abenz1267/elephant/internal/common"
 )
 
-func Query(query string) []common.Entry {
+var (
+	results      map[uint32]map[string]*DesktopFile
+	resultsMutex sync.Mutex
+)
+
+func init() {
+	results = make(map[uint32]map[string]*DesktopFile)
+}
+
+func Query(qid uint32, query string) []common.Entry {
 	start := time.Now()
 	desktop := os.Getenv("XDG_CURRENT_DESKTOP")
 	entries := []common.Entry{}
 
-	filesMu.RLock()
-	filesCopy := files
-	filesMu.RUnlock()
+	var toMatch map[string]*DesktopFile
 
-	for k, v := range filesCopy {
+	v, ok := results[qid]
+	if ok {
+		toMatch = v
+		slog.Info(Name, "query", "resuming", "files", len(toMatch))
+	} else {
+    filesMu.RLock()
+		toMatch = files
+    filesMu.RUnlock()
+	}
+
+	resultsMutex.Lock()
+	results[qid] = make(map[string]*DesktopFile)
+	resultsMutex.Unlock()
+
+	for k, v := range toMatch {
 		if len(v.NotShowIn) != 0 && slices.Contains(v.NotShowIn, desktop) || len(v.OnlyShowIn) != 0 && !slices.Contains(v.OnlyShowIn, desktop) || v.Hidden || v.NoDisplay {
 			continue
 		}
 
 		// add generic entry
-		if config.ShowActions && config.ShowGeneric || !config.ShowActions {
-
+		if config.ShowActions && config.ShowGeneric || !config.ShowActions || (config.ShowActions && len(v.Actions) == 0) || query == "" {
 			e := common.Entry{
 				Identifier: k,
 				Text:       v.Name,
 				SubText:    v.GenericName,
 				Icon:       v.Icon,
 				Provider:   Name,
-				Fuzzy: common.FuzzyMatchInfo{
-					Field: "text",
-				},
 			}
 
 			var match string
-			match, e.Score, e.Fuzzy.Pos, e.Fuzzy.Start = calcScore(query, &v.Data)
+			var ok bool
 
-			if match != e.Text {
-				e.SubText = match
-				e.Fuzzy.Field = "subtext"
+			if query != "" {
+				e.Fuzzy = &common.FuzzyMatchInfo{
+					Field: "text",
+				}
+
+				match, e.Score, e.Fuzzy.Pos, e.Fuzzy.Start, ok = calcScore(query, &v.Data)
+
+				if ok && match != e.Text {
+					e.SubText = match
+					e.Fuzzy.Field = "subtext"
+				}
 			}
 
-			if e.Score > 0 {
+			if e.Score > 0 || query == "" {
 				entries = append(entries, e)
+
+				resultsMutex.Lock()
+				results[qid][k] = v
+				resultsMutex.Unlock()
 			}
 		}
 
 		// add actions
-		if config.ShowActions {
+		if (query == "" && config.ShowActionsWithoutQuery) || (query != "" && config.ShowActions) {
 			for _, a := range v.Actions {
 
 				e := common.Entry{
@@ -62,21 +93,30 @@ func Query(query string) []common.Entry {
 					SubText:    v.Name,
 					Icon:       a.Icon,
 					Provider:   Name,
-					Fuzzy: common.FuzzyMatchInfo{
-						Field: "text",
-					},
 				}
 
 				var match string
-				match, e.Score, e.Fuzzy.Pos, e.Fuzzy.Start = calcScore(query, &a)
+				var ok bool
 
-				if match != e.Text {
-					e.SubText = match
-					e.Fuzzy.Field = "subtext"
+				if query != "" {
+					e.Fuzzy = &common.FuzzyMatchInfo{
+						Field: "text",
+					}
+
+					match, e.Score, e.Fuzzy.Pos, e.Fuzzy.Start, ok = calcScore(query, &a)
+
+					if ok && match != e.Text {
+						e.SubText = match
+						e.Fuzzy.Field = "subtext"
+					}
 				}
 
-				if e.Score > 0 {
+				if e.Score > 0 || query == "" {
 					entries = append(entries, e)
+
+					resultsMutex.Lock()
+					results[qid][k] = v
+					resultsMutex.Unlock()
 				}
 			}
 		}
@@ -87,7 +127,7 @@ func Query(query string) []common.Entry {
 	return entries
 }
 
-func calcScore(q string, d *Data) (string, int, *[]int, int) {
+func calcScore(q string, d *Data) (string, int, *[]int, int, bool) {
 	var scoreRes int
 	var posRes *[]int
 	var startRes int
@@ -106,7 +146,31 @@ func calcScore(q string, d *Data) (string, int, *[]int, int) {
 		}
 	}
 
-	scoreRes = scoreRes - max((modifier*10), 50)
+	if scoreRes == 0 {
+		return "", 0, nil, 0, false
+	}
 
-	return match, scoreRes, posRes, startRes
+	scoreRes = max(scoreRes-min(modifier*10, 50)-startRes, 10)
+
+	return match, scoreRes, posRes, startRes, true
+}
+
+func EntryToString(e common.Entry) string {
+	var start int
+	var field string
+
+	positions := []string{}
+
+	if e.Fuzzy != nil {
+		if e.Fuzzy.Pos != nil {
+			for _, num := range *e.Fuzzy.Pos {
+				positions = append(positions, strconv.Itoa(num))
+			}
+		}
+
+		start = e.Fuzzy.Start
+		field = e.Fuzzy.Field
+	}
+
+	return fmt.Sprintf("%s;%s;%s;%s;%s;%s;%d;%s", e.Provider, e.Identifier, e.Text, e.SubText, e.Icon, strings.Join(positions, ","), start, field)
 }
