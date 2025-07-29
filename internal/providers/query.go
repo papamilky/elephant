@@ -118,7 +118,7 @@ func Query(sid uint32, providers []string, text string, conn net.Conn) {
 	})
 
 	if len(entries) == 0 {
-		conn.Write(fmt.Appendln(nil, "NORESULTS"))
+		conn.Write(fmt.Appendf(nil, "qid;%d;noresults", currentQID))
 	}
 
 	for _, v := range entries {
