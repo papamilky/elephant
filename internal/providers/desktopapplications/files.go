@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"github.com/adrg/xdg"
 	"github.com/charlievieth/fastwalk"
 	"github.com/fsnotify/fsnotify"
@@ -15,25 +14,22 @@ import (
 )
 
 var (
-	files         map[string]*DesktopFile
-	watchedDirs   map[string]bool
-	filesMu       sync.RWMutex
-	watcherDirsMu sync.RWMutex
-	watcher       *fsnotify.Watcher
-	regionLocale  = ""
-	langLocale    = ""
+	files            map[string]*DesktopFile
+	watchedDirs      map[string]bool
+	symlinkToReal    map[string]string   // this should be [symlink]realfile
+	realToSymlink    map[string][]string // this should be [realfile][]symlink
+	filesMu          sync.RWMutex
+	watcherDirsMu    sync.RWMutex
+	symlinkTargetsMu sync.RWMutex // we use this for both symlink maps
+	watcher          *fsnotify.Watcher
+	regionLocale     = ""
+	langLocale       = ""
+	dirs             []string
 )
 
 func loadFiles() {
 	start := time.Now()
-
-	files = make(map[string]*DesktopFile)
-	watchedDirs = make(map[string]bool)
-
-	getLocale()
-
-	dirs := xdg.ApplicationDirs
-
+	setVars()
 	conf := fastwalk.Config{
 		Follow: true,
 	}
@@ -50,40 +46,10 @@ func loadFiles() {
 			continue
 		}
 
-		walkFn := func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				slog.Error(Name, "walk", err)
-				os.Exit(1)
-			}
-
-			filesMu.RLock()
-			_, exists := files[path]
-			filesMu.RUnlock()
-
-			if exists {
-				return nil
-			}
-
-			if !d.IsDir() && filepath.Ext(path) == ".desktop" {
-				filesMu.Lock()
-				files[path] = parseFile(path, langLocale, regionLocale)
-				filesMu.Unlock()
-			}
-
-			if d.IsDir() {
-				watcherDirsMu.RLock()
-				addDirToWatcher(path, watchedDirs)
-				watcherDirsMu.RUnlock()
-			}
-
-			return err
-		}
-
-		if err := fastwalk.Walk(&conf, root, walkFn); err != nil {
+		if err := fastwalk.Walk(&conf, root, walkFunction); err != nil {
 			slog.Error(Name, "walk", err)
 			os.Exit(1)
 		}
-
 	}
 
 	fileCount := len(files)
@@ -92,10 +58,70 @@ func loadFiles() {
 	slog.Info(Name, "watcher_dirs", len(watchedDirs))
 	go watchFiles()
 	slog.Info(Name, "watcher", "started")
+}
 
+func setVars() {
+	files = make(map[string]*DesktopFile)
+	watchedDirs = make(map[string]bool)
+	symlinkToReal = make(map[string]string)
+	realToSymlink = make(map[string][]string)
+
+	getLocale()
+
+	dirs = xdg.ApplicationDirs
+}
+
+func walkFunction(path string, d fs.DirEntry, err error) error {
+	if err != nil {
+		slog.Error(Name, "walk", err)
+		os.Exit(1)
+	}
+
+	filesMu.RLock()
+	_, exists := files[path]
+	filesMu.RUnlock()
+
+	if exists {
+		return nil
+	}
+
+	if !d.IsDir() && filepath.Ext(path) == ".desktop" {
+		addNewEntry(path)
+	}
+
+	if d.IsDir() {
+		addDirToWatcher(path, watchedDirs)
+	}
+
+	return err
+}
+
+func trackSymlinks(filename string) {
+	// for all intents and purposes, filename is the symlink
+	// targetPath is what it resolves to.
+	targetPath, sym := isSymlink(filename)
+	if !sym {
+		return
+	}
+
+	// setup two-way tracking
+	symlinkTargetsMu.Lock()
+	if realToSymlink[targetPath] == nil {
+		realToSymlink[targetPath] = make([]string, 0)
+		realToSymlink[targetPath] = append(realToSymlink[targetPath], filename)
+	}
+
+	symlinkToReal[filename] = targetPath
+	symlinkTargetsMu.Unlock()
+
+	addDirToWatcher(filepath.Dir(targetPath), watchedDirs)
+
+	slog.Debug(Name, "symlink_tracked", filename, "target", targetPath)
 }
 
 func addDirToWatcher(dir string, watchedDirs map[string]bool) {
+	watcherDirsMu.Lock()
+	defer watcherDirsMu.Unlock()
 	if watchedDirs[dir] {
 		return
 	}
@@ -129,12 +155,28 @@ func watchFiles() {
 	}
 }
 
+func checkSubdirOfXDG(subdir string) bool {
+	for _, dir := range dirs {
+		if strings.HasPrefix(subdir, dir) {
+			return true
+		}
+	}
+	return false
+}
+
 func handleFileEvent(event fsnotify.Event) {
-	fmt.Println(event)
+	slog.Debug(Name, "file_system_event", event)
 	if filepath.Ext(event.Name) != ".desktop" {
 		// Handle directory creation to watch new subdirectories
+
 		if event.Op&fsnotify.Create == fsnotify.Create {
 			if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+
+				// Don't track new subdirs of a dir we are only tracking for origin files
+				if !checkSubdirOfXDG(event.Name) {
+					return
+				}
+
 				if err := watcher.Add(event.Name); err != nil {
 					slog.Warn(Name, "watcher_add_new", err, "dir", event.Name)
 				}
@@ -155,34 +197,111 @@ func handleFileEvent(event fsnotify.Event) {
 	}
 }
 
+/*
+handleFileCreate
+we parse the desktop file
+if a file is a symlink, we need to track it and set the desktop entry
+
+if the file is not a symlink, then we check if any symlinks resolve to it
+if any symlinks resolve to it, we set the desktop entry for each of those
+if no symlinks resolve to it, we set the desktop entry for itself
+*/
 func handleFileCreate(path string) {
-	desktopFile := parseFile(path, langLocale, regionLocale)
-	if desktopFile != nil {
-		filesMu.Lock()
-		files[path] = desktopFile
-		filesMu.Unlock()
-
-		slog.Debug(Name, "file_created", path)
+	symlinkTargetsMu.Lock()
+	defer symlinkTargetsMu.Unlock()
+	_, sym := isSymlink(path)
+	defer slog.Debug(Name, "file_created", path)
+	if !sym {
+		if realToSymlink[path] != nil {
+			for _, symedFile := range realToSymlink[path] {
+				addNewEntry(symedFile)
+			}
+			return
+		}
+		if !checkSubdirOfXDG(path) {
+			return
+		}
 	}
+
+	addNewEntry(path)
 }
 
+/*
+handleFileUpdate
+we parse the desktop file
+if a file is a symlink, we need to track it and set the desktop entry
+if the file is not a symlink, then we check if any symlinks resolve to it
+if any symlinks resolve to it, we set the desktop entry for each of those
+if no symlinks resolve to it, we set the desktop entry for itself
+*/
 func handleFileUpdate(path string) {
-	desktopFile := parseFile(path, langLocale, regionLocale)
-	if desktopFile != nil {
+	symlinkTargetsMu.Lock()
+	defer symlinkTargetsMu.Unlock()
+	_, sym := isSymlink(path)
+	defer slog.Debug(Name, "file_updated", path)
+	if !sym {
+		if realToSymlink[path] != nil {
+			for _, symedFile := range realToSymlink[path] {
+				addNewEntry(symedFile)
+			}
+			return
+		}
+		if !checkSubdirOfXDG(path) {
+			return
+		}
+	}
+
+	addNewEntry(path)
+}
+
+/*
+handleFileUpdate
+if a file is a symlink, we resolve it.
+if the origin is referenced by more than this symlink, ignore it
+if the origin is not referenced by more than this symlink, untrack it
+*/
+func handleFileRemove(path string) {
+	symlinkTargetsMu.Lock()
+	defer symlinkTargetsMu.Unlock()
+	originPath, sym := isSymlink(path)
+	defer slog.Debug(Name, "file_removed", path)
+	if sym {
 		filesMu.Lock()
-		files[path] = desktopFile
+		delete(files, path)
 		filesMu.Unlock()
 
-		slog.Debug(Name, "file_updated", path)
+		delete(symlinkToReal, path)
+
+		for i, s := range realToSymlink[originPath] {
+			if s == path {
+				realToSymlink[originPath] = append(realToSymlink[originPath][:i], realToSymlink[originPath][i+1:]...)
+			}
+		}
+		if len(realToSymlink[originPath]) == 0 {
+			delete(realToSymlink, originPath)
+		}
+	}
+
+	if realToSymlink[path] != nil {
+		for _, symedFile := range realToSymlink[path] {
+			delete(symlinkToReal, symedFile)
+		}
 	}
 }
 
-func handleFileRemove(path string) {
-	filesMu.Lock()
-	delete(files, path)
-	filesMu.Unlock()
+func addNewEntry(path string) {
+	if origin, sym := isSymlink(path); sym {
+		// check the file the symlink points to actually exists
+		// otherwise it'll panic if you point to a location that's invalid
+		trackSymlinks(path)
+		if !fileExists(origin) {
+			return
+		}
+	}
 
-	slog.Debug(Name, "file_removed", path)
+	filesMu.Lock()
+	files[path] = parseFile(path, langLocale, regionLocale)
+	filesMu.Unlock()
 }
 
 func getLocale() {
@@ -205,4 +324,25 @@ func getLocale() {
 	}
 
 	langLocale = strings.Split(regionLocale, "_")[0]
+}
+
+func isSymlink(filename string) (string, bool) {
+	targetPath, err := os.Readlink(filename)
+	if err != nil {
+		return "", false
+	}
+
+	if !filepath.IsAbs(targetPath) {
+		targetPath = filepath.Join(filepath.Dir(filename), targetPath)
+	}
+
+	if targetPath == filename { // probably not needed, but maybe?
+		return "", false
+	}
+	return targetPath, true
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
