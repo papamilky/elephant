@@ -9,7 +9,7 @@ import (
 
 var runPrefix = ""
 
-func init() {
+func InitRunPrefix() {
 	app2unit, err := exec.LookPath("app2unit")
 	if err == nil && app2unit != "" {
 		xdgTerminalExec, err := exec.LookPath("xdg-terminal-exec")
@@ -36,6 +36,16 @@ func init() {
 	}
 }
 
-func WrapWithPrefix(in string) string {
-	return fmt.Sprintf("%s %s", runPrefix, in)
+func WrapWithPrefix(override, in string) string {
+	if override == "CLEAR" {
+		return in
+	}
+
+	prefix := override
+
+	if prefix == "" {
+		prefix = runPrefix
+	}
+
+	return fmt.Sprintf("%s %s", prefix, in)
 }

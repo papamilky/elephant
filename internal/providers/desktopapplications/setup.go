@@ -10,8 +10,10 @@ var (
 	NamePretty = "Desktop Applications"
 )
 
-// TODO: watch folders for changes
-func Load() {
+func init() {
 	loadConfig()
+}
+
+func Load() {
 	loadFiles()
 }
