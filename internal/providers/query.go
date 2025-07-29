@@ -122,13 +122,15 @@ func Query(sid uint32, providers []string, text string, conn net.Conn) {
 	}
 
 	for _, v := range entries {
-		if currentIteration != queries[sid][currentQID].Iteration.Load() {
+		if text != "" && currentIteration != queries[sid][currentQID].Iteration.Load() {
 			slog.Info("providers", "results", "aborting", "qid", currentQID, "iid", currentIteration)
 			return
 		}
 
 		conn.Write(fmt.Appendf(nil, "%d;%d;%s\n", currentQID, currentIteration, Providers[v.Provider].EntryToString(v)))
 	}
+
+	conn.Write(fmt.Appendf(nil, "qid;%d;done\n", currentQID))
 
 	slog.Info("providers", "results", len(entries), "time", time.Since(start))
 }
