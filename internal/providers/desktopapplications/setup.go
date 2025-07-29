@@ -14,5 +14,4 @@ var (
 func Load() {
 	loadConfig()
 	loadFiles()
-	startWatcher()
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"github.com/adrg/xdg"
 	"github.com/charlievieth/fastwalk"
 	"github.com/fsnotify/fsnotify"
@@ -14,17 +15,20 @@ import (
 )
 
 var (
-	files        map[string]*DesktopFile
-	filesMu      sync.RWMutex
-	watcher      *fsnotify.Watcher
-	regionLocale = ""
-	langLocale   = ""
+	files         map[string]*DesktopFile
+	watchedDirs   map[string]bool
+	filesMu       sync.RWMutex
+	watcherDirsMu sync.RWMutex
+	watcher       *fsnotify.Watcher
+	regionLocale  = ""
+	langLocale    = ""
 )
 
 func loadFiles() {
 	start := time.Now()
 
 	files = make(map[string]*DesktopFile)
+	watchedDirs = make(map[string]bool)
 
 	getLocale()
 
@@ -32,6 +36,13 @@ func loadFiles() {
 
 	conf := fastwalk.Config{
 		Follow: true,
+	}
+
+	var err error
+	watcher, err = fsnotify.NewWatcher()
+	if err != nil {
+		slog.Error(Name, "watcher_init", err)
+		return
 	}
 
 	for _, root := range dirs {
@@ -59,6 +70,12 @@ func loadFiles() {
 				filesMu.Unlock()
 			}
 
+			if d.IsDir() {
+				watcherDirsMu.RLock()
+				addDirToWatcher(path, watchedDirs)
+				watcherDirsMu.RUnlock()
+			}
+
 			return err
 		}
 
@@ -70,47 +87,12 @@ func loadFiles() {
 	}
 
 	fileCount := len(files)
-
 	slog.Info(Name, "files", fileCount, "time", time.Since(start))
-}
-
-func startWatcher() {
-	var err error
-	watcher, err = fsnotify.NewWatcher()
-	if err != nil {
-		slog.Error(Name, "watcher_init", err)
-		return
-	}
-
-	dirs := xdg.ApplicationDirs
-	watchedDirs := make(map[string]bool)
-
-	for _, root := range dirs {
-		if _, err := os.Stat(root); err != nil {
-			continue
-		}
-
-		addDirToWatcher(root, watchedDirs)
-
-		conf := fastwalk.Config{Follow: true}
-		walkFn := func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-
-			if d.IsDir() {
-				addDirToWatcher(path, watchedDirs)
-			}
-
-			return nil
-		}
-
-		fastwalk.Walk(&conf, root, walkFn)
-	}
-
-	go watchFiles()
 
 	slog.Info(Name, "watcher_dirs", len(watchedDirs))
+	go watchFiles()
+	slog.Info(Name, "watcher", "started")
+
 }
 
 func addDirToWatcher(dir string, watchedDirs map[string]bool) {
@@ -148,6 +130,7 @@ func watchFiles() {
 }
 
 func handleFileEvent(event fsnotify.Event) {
+	fmt.Println(event)
 	if filepath.Ext(event.Name) != ".desktop" {
 		// Handle directory creation to watch new subdirectories
 		if event.Op&fsnotify.Create == fsnotify.Create {
